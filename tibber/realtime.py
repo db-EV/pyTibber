@@ -23,6 +23,13 @@ LOCK_CONNECT = asyncio.Lock()
 
 _LOGGER = logging.getLogger(__name__)
 
+_MAX_BACKOFF_SECONDS = 5 * 60
+
+
+def _backoff_delay(retry_count: int) -> int:
+    """Calculate exponential backoff delay with jitter."""
+    return min(random.SystemRandom().randint(1, 30) + retry_count**2, _MAX_BACKOFF_SECONDS)
+
 
 class TibberRT:
     """Class to handle real time connection with the Tibber api."""
@@ -43,6 +50,8 @@ class TibberRT:
         self._homes: list[TibberHome] = []
         self._watchdog_runner: None | asyncio.Task[Any] = None
         self._watchdog_running: bool = False
+        self._watchdog_retry_count: int = 0
+        self._watchdog_next_test_time: dt.datetime = dt.datetime.min.replace(tzinfo=dt.UTC)
 
         self.sub_manager: Client | None = None
         self.session: Any | None = None
@@ -117,7 +126,7 @@ class TibberRT:
         try:
             if self.session is not None and self.sub_manager is not None:
                 await self.sub_manager.close_async()
-        except Exception:
+        except Exception:  # noqa: BLE001
             _LOGGER.exception("Error in watchdog close")
         self.session = None
         self.sub_manager = None
@@ -129,81 +138,103 @@ class TibberRT:
 
         await asyncio.sleep(60)
 
-        _retry_count = 0
-        next_test_all_homes_running = dt.datetime.now(tz=dt.UTC)
+        self._watchdog_retry_count = 0
+        self._watchdog_next_test_time = dt.datetime.now(tz=dt.UTC)
         while self._watchdog_running:
             await asyncio.sleep(5)
 
             if self.sub_manager is not None:
                 now = dt.datetime.now(tz=dt.UTC)
-                if (
-                    self.sub_manager.transport.running
-                    and self.sub_manager.transport.reconnect_at > now
-                    and now > next_test_all_homes_running
-                ):
+
+                if not self.sub_manager.transport.running or self.sub_manager.transport.reconnect_at <= now:
+                    # Transport is dead: log and tear down so the reconnect block below runs.
+                    _LOGGER.error("Watchdog: Connection is down, %s", now)
+                    await self._close_sub_manager()
+                    # sub_manager is now None; falls through to the reconnect block.
+                else:
+                    # Transport is alive. Skip home-liveness check during the grace period.
+                    if now <= self._watchdog_next_test_time:
+                        continue
+
                     if self._check_all_homes_alive():
-                        _retry_count = 0
+                        self._watchdog_retry_count = 0
                         _LOGGER.debug("Watchdog: Connection is alive")
                         continue
-                    next_test_all_homes_running = now + dt.timedelta(seconds=60)
 
-                self.sub_manager.transport.reconnect_at = dt.datetime.now(tz=dt.UTC) + dt.timedelta(
-                    seconds=self._timeout,
-                )
-                _LOGGER.error(
-                    "Watchdog: Connection is down, %s",
-                    self.sub_manager.transport.reconnect_at,
-                )
-                await self._close_sub_manager()
+                    # Transport is alive but some homes stopped receiving data.
+                    _LOGGER.warning("Watchdog: Some homes not receiving data, resubscribing stale homes")
+                    self._watchdog_next_test_time = now + dt.timedelta(seconds=60)
+                    try:
+                        await self._resubscribe_stale_homes()
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.exception("Error resubscribing stale homes")
+                    continue
 
-            if not self._watchdog_running:
-                _LOGGER.debug("Watchdog: Stopping")
+            if not await self._watchdog_reconnect():
                 return
 
-            if self.on_reconnect_cb is not None:
-                try:
-                    await self.on_reconnect_cb()
-                except InvalidLoginError:
-                    delay_seconds = min(
-                        random.SystemRandom().randint(1, 30) + _retry_count**2,
-                        5 * 60,
-                    )
-                    _retry_count += 1
-                    _LOGGER.error(
-                        "Access token expired (attempt %s), retrying in %s seconds",
-                        _retry_count,
-                        delay_seconds,
-                    )
-                    await asyncio.sleep(delay_seconds)
-                    continue
-                except Exception:
-                    _LOGGER.exception("Error in watchdog reconnect callback")
+    async def _watchdog_reconnect(self) -> bool:
+        """Attempt reconnection after transport failure.
 
+        :return: True to continue the watchdog loop, False to stop.
+        """
+        if not self._watchdog_running:
+            _LOGGER.debug("Watchdog: Stopping")
+            return False
+
+        if self.on_reconnect_cb is not None:
             try:
-                await self._resubscribe_homes()
-            except Exception as err:  # noqa: BLE001
-                delay_seconds = min(
-                    random.SystemRandom().randint(1, 30) + _retry_count**2,
-                    5 * 60,
-                )
-                _retry_count += 1
+                await self.on_reconnect_cb()
+            except InvalidLoginError:
+                delay_seconds = _backoff_delay(self._watchdog_retry_count)
+                self._watchdog_retry_count += 1
                 _LOGGER.error(
-                    "Error in watchdog connect, retrying in %s seconds, %s: %s",
+                    "Access token expired (attempt %s), retrying in %s seconds",
+                    self._watchdog_retry_count,
                     delay_seconds,
-                    _retry_count,
-                    err,
-                    exc_info=_retry_count > 1,
                 )
                 await asyncio.sleep(delay_seconds)
-            else:
-                _retry_count = 0
-                _LOGGER.debug("Watchdog: Reconnected successfully")
-                await asyncio.sleep(60)
+                return True
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Error in watchdog reconnect callback")
+
+        try:
+            await self._resubscribe_homes()
+        except Exception as err:
+            delay_seconds = _backoff_delay(self._watchdog_retry_count)
+            self._watchdog_retry_count += 1
+            _LOGGER.error(
+                "Error in watchdog connect, retrying in %s seconds, %s: %s",
+                delay_seconds,
+                self._watchdog_retry_count,
+                err,
+                exc_info=self._watchdog_retry_count > 1,
+            )
+            await self._close_sub_manager()
+            await asyncio.sleep(delay_seconds)
+        else:
+            self._watchdog_retry_count = 0
+            _LOGGER.debug("Watchdog: Reconnected successfully")
+            # Grace period: give homes 90 s to start receiving data before the
+            # liveness check runs.  Sleep only 30 s here; the remaining time is
+            # covered by _watchdog_next_test_time.
+            now = dt.datetime.now(tz=dt.UTC)
+            self._watchdog_next_test_time = now + dt.timedelta(seconds=90)
+            await asyncio.sleep(30)
+        return True
 
     async def _resubscribe_homes(self) -> None:
         """Resubscribe to all homes."""
         _LOGGER.debug("Resubscribing to homes")
-        await asyncio.gather(*[home.rt_resubscribe() for home in self._homes])
+        await asyncio.gather(*[home.rt_resubscribe(skip_tibber_update=True) for home in self._homes])
+
+    async def _resubscribe_stale_homes(self) -> None:
+        """Resubscribe only homes that are not receiving real-time data."""
+        stale_homes = [home for home in self._homes if not home.rt_subscription_running]
+        if not stale_homes:
+            return
+        _LOGGER.debug("Resubscribing %d stale home(s)", len(stale_homes))
+        await asyncio.gather(*[home.rt_resubscribe(skip_tibber_update=True) for home in stale_homes])
 
     def add_home(self, home: TibberHome) -> bool:
         """Add home to real time subscription."""
